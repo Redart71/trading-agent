@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 import warnings
-
+import html
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD, SMAIndicator, EMAIndicator
 from ta.volatility import BollingerBands
@@ -13,10 +13,66 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 import plotly.graph_objects as go
+from pathlib import Path
+import hashlib
+import streamlit_authenticator as stauth
+import yaml
+from yaml.loader import SafeLoader
+
+st.set_page_config(page_title="Agent de Trading CAC 40", layout="wide")
+
+
+# Chargement de la configuration
+with open('config.yaml') as file:
+    config = yaml.load(file, Loader=SafeLoader)
+
+# Instanciation de l'authentificateur
+authenticator = stauth.Authenticate(
+    config['credentials'],
+    config['cookie']['name'],
+    config['cookie']['key'],
+    config['cookie']['expiry_days']
+)
+
+# Vérification si l'utilisateur est déjà authentifié via la session
+if 'authentication_status' in st.session_state and st.session_state['authentication_status'] is True:
+    # L'utilisateur est déjà connecté
+    name = st.session_state['name']
+    username = st.session_state['username']
+    st.sidebar.success(f"Bienvenue {name} 👋")
+    authenticator.logout("Se déconnecter", "sidebar")
+else:
+    # L'utilisateur n'est pas encore authentifié, nous demandons la connexion
+    login_result = authenticator.login()
+
+    if login_result is None:
+        st.warning("Veuillez entrer vos identifiants.")
+        st.stop()  # Arrêter le script si aucun login n'est effectué
+    else:
+        name, authentication_status, username = login_result
+
+        if authentication_status is False:
+            st.error("Nom d'utilisateur ou mot de passe incorrect.")
+            st.stop()
+        elif authentication_status is None:
+            st.warning("Veuillez entrer vos identifiants.")
+            st.stop()
+        else:
+            # L'utilisateur est authentifié avec succès
+            st.sidebar.success(f"Bienvenue {name} 👋")
+            authenticator.logout("Se déconnecter", "sidebar")
+
+
+
+def sha256sum(filepath):
+    with open(filepath, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
-st.set_page_config(page_title="Agent de Trading CAC 40", layout="wide")
+
+DATA_DIR = Path("data").resolve()
 
 ALL_CAC40_TICKERS = {
     "Air Liquide": "AI.PA", "Airbus": "AIR.PA", "ArcelorMittal": "MT.AS",
@@ -40,14 +96,56 @@ available_tickers = {name: ticker for name, ticker in ALL_CAC40_TICKERS.items() 
 def load_data():
     data = {}
     for name, ticker in available_tickers.items():
-        path = f"data/{ticker}.csv"
         try:
-            df = pd.read_csv(path, index_col="Date", parse_dates=True)
-            if "Close" in df.columns and not df.empty:
-                data[ticker] = df
+            # Construction sécurisée des chemins
+            file_path = (DATA_DIR / f"{ticker}.csv").resolve()
+            hash_path = file_path.with_suffix(".hash")
+
+            # Vérification que le fichier est bien dans le dossier 'data/'
+            if not str(file_path).startswith(str(DATA_DIR)):
+                raise ValueError("Tentative d'accès non autorisée en dehors de /data")
+
+            # Vérification d'intégrité
+            if hash_path.exists():
+                with open(hash_path, "r") as h:
+                    saved_hash = h.read().strip()
+                current_hash = sha256sum(file_path)
+
+                if saved_hash != current_hash:
+                    st.error(f"⚠️ Fichier {ticker}.csv modifié ou corrompu (hash invalide).")
+                    continue  # Ne pas charger ce fichier
+            else:
+                st.warning(f"🔍 Pas de fichier .hash pour {ticker}.csv, intégrité non vérifiée.")
+
+            # Chargement du fichier
+            df = pd.read_csv(file_path, index_col="Date", parse_dates=True)
+
+            # Sécurité contre empoisonnement : validation des colonnes et des types
+            required_columns = {"Open", "High", "Low", "Close", "Volume"}
+            if not required_columns.issubset(df.columns):
+                st.error(f"❌ Fichier {ticker}.csv invalide : colonnes manquantes.")
+                continue
+
+            if not all(np.issubdtype(df[col].dtype, np.number) for col in required_columns):
+                st.error(f"❌ Données non numériques détectées dans {ticker}.csv")
+                continue
+
+            if (df[list(required_columns)] < 0).any().any():
+                st.error(f"❌ Données invalides (valeurs négatives) dans {ticker}.csv")
+                continue
+
+            if df.empty:
+                st.warning(f"⚠️ Le fichier {ticker}.csv est vide.")
+                continue
+
+            data[ticker] = df
+
         except Exception as e:
-            st.warning(f"Erreur lors de la lecture de {path} : {e}")
+            st.warning(f"Erreur lors de la lecture de {ticker}.csv : {e}")
+
     return data
+
+
 
 def add_indicators(df):
     df = df.copy()
@@ -123,6 +221,18 @@ else:
         else:
             st.subheader(f"Recommandation pour {selected_name} ({selected_ticker})")
             latest = X.iloc[[-1]]
+            # Validation anti-évasion : détecter NaN ou outliers extrêmes dans la dernière ligne
+            if latest.isnull().values.any():
+                st.error("⚠️ Valeurs manquantes détectées dans les entrées du modèle.")
+                st.stop()
+
+            # Détection de valeurs anormales (z-score > 5 par exemple)
+            from scipy.stats import zscore
+            z_scores = np.abs(zscore(latest))
+            if (z_scores > 5).any():
+                st.error("⚠️ Entrée suspecte détectée (valeur extrême). Prédiction bloquée.")
+                st.stop()
+
             prediction = model.predict(latest)[0]
             # Calcul de la probabilité
             prediction_proba = model.predict_proba(latest)[0]
@@ -135,7 +245,8 @@ else:
                 else "Vendre" if prediction == -1
                 else "Neutre"
             )
-
+            # Echappement du texte pour éviter les attaques XSS
+            safe_prediction_text = html.escape(prediction_text)
             # Couleur du badge
             badge_color = (
                 "#28a745" if certainty > 0.7 else
@@ -196,7 +307,7 @@ else:
                         align-items: center;
                         gap: 0.5rem;
                     '>
-                        {"📈" if prediction == 1 else "📉" if prediction == -1 else "⏸️"} {prediction_text}
+                        {"📈" if prediction == 1 else "📉" if prediction == -1 else "⏸️"} {safe_prediction_text}
                     </h2>
                     <div style='
                         font-size: 0.875rem;

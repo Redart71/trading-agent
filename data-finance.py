@@ -2,6 +2,12 @@ import yfinance as yf
 import os
 import pandas as pd
 from datetime import datetime
+import hashlib
+from pathlib import Path
+
+def sha256sum(filepath):
+    with open(filepath, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 # Dictionnaire des tickers Yahoo Finance du CAC 40
 CAC40_TICKERS = {
@@ -73,12 +79,27 @@ for name, ticker in CAC40_TICKERS.items():
             if len(lines) > 1 and lines[1].startswith(','):
                 del lines[1]
 
-            # Écrire le fichier corrigé
-            cleaned_file_path = f"data/{ticker}.csv"
-            with open(cleaned_file_path, 'w', encoding='utf-8', newline='') as f:
+            # Construction du chemin sécurisé
+            data_path = Path("data").resolve()
+            csv_path = (data_path / f"{ticker}.csv").resolve()
+
+            # Vérification de sécurité
+            if not str(csv_path).startswith(str(data_path)):
+                raise ValueError("Chemin non autorisé en dehors du dossier data")
+
+            # Écriture sécurisée du fichier
+            with open(csv_path, 'w', encoding='utf-8', newline='') as f:
                 f.writelines(lines)
 
-            print(f"✅ Données de {name} sauvegardées sous {cleaned_file_path}")
+            # Calcul et sauvegarde du hash
+            hash = sha256sum(csv_path)
+            hash_path = csv_path.with_suffix(".hash")
+            with open(hash_path, "w") as h:
+                h.write(hash)
+
+            print(f"✅ Données de {name} sauvegardées sous {csv_path}")
+            print(f"🔐 SHA256 : {hash}")
+
         else:
             print(f"⚠️ Aucune donnée reçue pour {ticker}")
     except Exception as e:
